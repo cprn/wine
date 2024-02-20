@@ -48,7 +48,11 @@ struct vfw_capture
     CRITICAL_SECTION state_cs;
 
     HANDLE thread;
+
+    int index;
 };
+
+static char currently_active[10] = { 0 };
 
 static inline struct vfw_capture *impl_from_strmbase_filter(struct strmbase_filter *iface)
 {
@@ -109,6 +113,7 @@ static void vfw_capture_destroy(struct strmbase_filter *iface)
     DeleteCriticalSection(&filter->state_cs);
     strmbase_source_cleanup(&filter->source);
     strmbase_filter_cleanup(&filter->filter);
+    currently_active[filter->index] = 0;
     free(filter);
 }
 
@@ -568,10 +573,18 @@ static HRESULT WINAPI PPB_Load(IPersistPropertyBag *iface, IPropertyBag *bag, IE
         return hr;
 
     params.index = V_I4(&var);
+    if (currently_active[params.index])
+        return E_FAIL;
+
     params.device = &filter->device;
     hr = V4L_CALL( create, &params );
 
-    if (SUCCEEDED(hr)) filter->init = TRUE;
+    if (SUCCEEDED(hr))
+    {
+        filter->index = params.index;
+        filter->init = TRUE;
+        currently_active[params.index] = 1;
+    }
     return hr;
 }
 
@@ -852,11 +865,24 @@ static HRESULT WINAPI video_control_GetFrameRateList(IAMVideoControl *iface, IPi
         SIZE dimensions, LONG *list_size, LONGLONG **frame_rate)
 {
     struct vfw_capture *filter = impl_from_IAMVideoControl(iface);
-
-    FIXME("filter %p, pin %p, index %ld, dimensions (%ldx%ld), list size %p, frame rate %p, stub.\n",
-            filter, pin, index, dimensions.cx, dimensions.cy, list_size, frame_rate);
-
-    return E_NOTIMPL;
+    LONGLONG *rates = NULL;
+    HRESULT hr;
+    TRACE("filter %p, pin %p, index %d, dimensions (%dx%d), list size %p, frame rate: %p\n",
+        filter, pin, index, dimensions.cx, dimensions.cy, list_size, frame_rate);
+    struct get_frame_rate_params params = { 0 };
+    params.device = filter->device;
+    params.index = index;
+    params.num_rates = list_size;
+    hr = V4L_CALL(get_frame_rates, &params);
+    if (frame_rate && hr == S_OK)
+    {
+        if (!(rates = CoTaskMemAlloc(sizeof(LONGLONG)*(*list_size))))
+            return E_OUTOFMEMORY;
+        *frame_rate = rates;
+        params.rates = rates;
+        return V4L_CALL(get_frame_rates, &params);
+    }
+    return hr;
 }
 
 static const IAMVideoControlVtbl IAMVideoControl_VTable =

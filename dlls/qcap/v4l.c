@@ -60,6 +60,8 @@ static typeof(close) *video_close = close;
 static typeof(ioctl) *video_ioctl = ioctl;
 static typeof(read) *video_read = read;
 
+#define CHARRIFY_FOURCC(p) (char)p, (char)(p >> 8), (char)(p >> 16), (char)(p >> 24)
+
 static BOOL video_init(void)
 {
 #ifdef SONAME_LIBV4L2
@@ -86,6 +88,8 @@ struct caps
     AM_MEDIA_TYPE media_type;
     VIDEOINFOHEADER video_info;
     VIDEO_STREAM_CONFIG_CAPS config;
+    struct v4l2_fract framerates[12];
+    int num_framerates;
 };
 
 struct video_capture_device
@@ -98,6 +102,7 @@ struct video_capture_device
     BYTE *image_data;
 
     int fd, mmap;
+    LONGLONG current_rate;
 };
 
 static int xioctl(int fd, int request, void * arg)
@@ -140,7 +145,8 @@ static const struct caps *find_caps(struct video_capture_device *device, const A
 
         if (IsEqualGUID(&mt->formattype, &caps->media_type.formattype)
                 && video_info->bmiHeader.biWidth == caps->video_info.bmiHeader.biWidth
-                && video_info->bmiHeader.biHeight == caps->video_info.bmiHeader.biHeight)
+                && video_info->bmiHeader.biHeight == caps->video_info.bmiHeader.biHeight
+                && IsEqualGUID(&mt->subtype, &caps->media_type.subtype))
             return caps;
     }
     return NULL;
@@ -162,9 +168,35 @@ static NTSTATUS v4l_device_check_format( void *args )
     return E_FAIL;
 }
 
+static void set_capture_rate(struct video_capture_device *device, const AM_MEDIA_TYPE *mt)
+{
+    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+    {
+        struct v4l2_streamparm parm = { 0 };
+        VIDEOINFOHEADER vinfo = *(VIDEOINFOHEADER *)mt->pbFormat;
+        if (device->current_rate == vinfo.AvgTimePerFrame)
+            return;
+        for (int i = 0; i < device->current_caps->num_framerates; i++)
+        {
+            const struct v4l2_fract *rate = &device->current_caps->framerates[i];
+            if (10000000/(rate->denominator / rate->numerator) == vinfo.AvgTimePerFrame)
+            {
+                parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                parm.parm.capture.timeperframe.denominator = rate->denominator;
+                parm.parm.capture.timeperframe.numerator = rate->numerator;
+                xioctl(device->fd, VIDIOC_S_PARM, &parm);
+                /* check for success? */
+                break;
+            }
+        }
+        device->current_rate = vinfo.AvgTimePerFrame;
+    }
+}
+
 static HRESULT set_caps(struct video_capture_device *device, const struct caps *caps)
 {
     struct v4l2_format format = {0};
+    struct v4l2_streamparm streamparm = {0};
     LONG width, height, image_size;
     BYTE *image_data;
 
@@ -197,6 +229,17 @@ static HRESULT set_caps(struct video_capture_device *device, const struct caps *
     device->image_pitch = width * caps->video_info.bmiHeader.biBitCount / 8;
     free(device->image_data);
     device->image_data = image_data;
+    streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(device->fd, VIDIOC_G_PARM, &streamparm) == 0)
+    {
+        if (streamparm.parm.capture.timeperframe.numerator != 0)
+        {
+            device->current_rate = 10000000/(streamparm.parm.capture.timeperframe.denominator
+                / streamparm.parm.capture.timeperframe.numerator);
+        }
+        else
+            device->current_rate = 10000000/30;
+    }
     return S_OK;
 }
 
@@ -205,15 +248,22 @@ static NTSTATUS v4l_device_set_format( void *args )
     const struct set_format_params *params = args;
     struct video_capture_device *device = get_device(params->device);
     const struct caps *caps;
+    HRESULT ret;
 
     caps = find_caps(device, params->mt);
     if (!caps)
         return E_FAIL;
 
     if (device->current_caps == caps)
+    {
+        set_capture_rate(device, params->mt);
         return S_OK;
+    }
+    ret = set_caps(device, caps);
+    if (SUCCEEDED(ret))
+        set_capture_rate(device, params->mt);
 
-    return set_caps(device, caps);
+    return ret;
 }
 
 static NTSTATUS v4l_device_get_format( void *args )
@@ -364,7 +414,7 @@ static NTSTATUS v4l_device_read_frame( void *args )
 }
 
 static void fill_caps(__u32 pixelformat, __u32 width, __u32 height,
-        __u32 max_fps, __u32 min_fps, struct caps *caps)
+        __u32 max_fps, __u32 min_fps, int num_framerates, struct caps *caps)
 {
     LONG depth = 24;
 
@@ -397,6 +447,7 @@ static void fill_caps(__u32 pixelformat, __u32 width, __u32 height,
     caps->config.MinBitsPerSecond = width * height * depth * min_fps;
     caps->config.MaxBitsPerSecond = width * height * depth * max_fps;
     caps->pixelformat = pixelformat;
+    caps->num_framerates = num_framerates;
 }
 
 static NTSTATUS v4l_device_get_caps( void *args )
@@ -419,13 +470,108 @@ static NTSTATUS v4l_device_get_caps_count( void *args )
     return S_OK;
 }
 
+static void v4l_device_query_format(struct video_capture_device *device, __u32 pixformat)
+{
+    int fd = device->fd;
+    struct v4l2_frmsizeenum frmsize = {0};
+    struct v4l2_format format = {0};
+
+    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_G_FMT, &format) == -1)
+    {
+        ERR("Failed to get device format: %s\n", strerror(errno));
+        return;
+    }
+
+    format.fmt.pix.pixelformat = pixformat;
+    if (xioctl(fd, VIDIOC_TRY_FMT, &format) == -1
+            || format.fmt.pix.pixelformat != pixformat)
+    {
+        TRACE("This device doesn't support %c%c%c%c format.\n", CHARRIFY_FOURCC(pixformat));
+        return;
+    }
+
+    frmsize.pixel_format = pixformat;
+    while (xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) != -1)
+    {
+        struct v4l2_frmivalenum frmival = {0};
+        __u32 max_fps = 30, min_fps = 30;
+        struct caps *new_caps;
+        struct v4l2_fract frame_rates[12] = { 0 };
+        int num_fps = 0;
+
+        frmival.pixel_format = format.fmt.pix.pixelformat;
+        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
+        {
+            frmival.width = frmsize.discrete.width;
+            frmival.height = frmsize.discrete.height;
+        }
+        else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE)
+        {
+            frmival.width = frmsize.stepwise.max_width;
+            frmival.height = frmsize.stepwise.min_height;
+        }
+        else
+        {
+            FIXME("Unhandled frame size type: %d.\n", frmsize.type);
+            continue;
+        }
+
+        while (xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) != -1)
+        {
+            if (num_fps > 11)
+                break;
+            if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE)
+            {
+                __u32 newfps = frmival.discrete.denominator / frmival.discrete.numerator;
+                if (newfps > max_fps)
+                    max_fps = newfps;
+                if (newfps < min_fps)
+                    min_fps = newfps;
+                frame_rates[num_fps].denominator = frmival.discrete.denominator;
+                frame_rates[num_fps++].numerator = frmival.discrete.numerator;
+                frmival.index++;
+            }
+            else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE
+                    || frmival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS)
+            {
+                 max_fps = frmival.stepwise.max.denominator / frmival.stepwise.max.numerator;
+                 min_fps = frmival.stepwise.min.denominator / frmival.stepwise.min.numerator;
+                /* Fill frame_rates here? */
+                num_fps++;
+                frame_rates[0].denominator = frmival.stepwise.min.denominator;
+                frame_rates[0].numerator = frmival.stepwise.min.denominator;
+                break;
+
+            }
+        }
+        if (num_fps == 0)
+        {
+            ERR("Failed to get fps: %s.\n", strerror(errno));
+            frame_rates[0].denominator = 30;
+            frame_rates[0].numerator = 1;
+            num_fps++;
+        }
+
+        new_caps = realloc(device->caps, (device->caps_count + 1) * sizeof(*device->caps));
+        if (!new_caps)
+            return;
+        device->caps = new_caps;
+        fill_caps(format.fmt.pix.pixelformat, frmsize.discrete.width, frmsize.discrete.height,
+                max_fps, min_fps, num_fps, &device->caps[device->caps_count]);
+        memcpy(&device->caps[device->caps_count].framerates, &frame_rates, sizeof(frame_rates));
+
+        device->caps_count++;
+
+        frmsize.index++;
+    }
+}
+
 static NTSTATUS v4l_device_create( void *args )
 {
     const struct create_params *params = args;
-    struct v4l2_frmsizeenum frmsize = {0};
     struct video_capture_device *device;
     struct v4l2_capability caps = {{0}};
-    struct v4l2_format format = {0};
     BOOL have_libv4l2;
     char path[20];
     HRESULT hr;
@@ -478,73 +624,11 @@ static NTSTATUS v4l_device_create( void *args )
 #endif
         goto error;
     }
-
-    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(fd, VIDIOC_G_FMT, &format) == -1)
-    {
-        ERR("Failed to get device format: %s\n", strerror(errno));
+    /* Worthwhile to support more formats? */
+    v4l_device_query_format(device, V4L2_PIX_FMT_BGR24);
+    if (!device->caps_count)
         goto error;
-    }
 
-    format.fmt.pix.pixelformat = V4L2_PIX_FMT_BGR24;
-    if (xioctl(fd, VIDIOC_TRY_FMT, &format) == -1
-            || format.fmt.pix.pixelformat != V4L2_PIX_FMT_BGR24)
-    {
-        ERR("This device doesn't support V4L2_PIX_FMT_BGR24 format.\n");
-        goto error;
-    }
-
-    frmsize.pixel_format = V4L2_PIX_FMT_BGR24;
-    while (xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) != -1)
-    {
-        struct v4l2_frmivalenum frmival = {0};
-        __u32 max_fps = 30, min_fps = 30;
-        struct caps *new_caps;
-
-        frmival.pixel_format = format.fmt.pix.pixelformat;
-        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
-        {
-            frmival.width = frmsize.discrete.width;
-            frmival.height = frmsize.discrete.height;
-        }
-        else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE)
-        {
-            frmival.width = frmsize.stepwise.max_width;
-            frmival.height = frmsize.stepwise.min_height;
-        }
-        else
-        {
-            FIXME("Unhandled frame size type: %d.\n", frmsize.type);
-            continue;
-        }
-
-        if (xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) != -1)
-        {
-            if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE)
-            {
-                max_fps = frmival.discrete.denominator / frmival.discrete.numerator;
-                min_fps = max_fps;
-            }
-            else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE
-                    || frmival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS)
-            {
-                min_fps = frmival.stepwise.max.denominator / frmival.stepwise.max.numerator;
-                max_fps = frmival.stepwise.min.denominator / frmival.stepwise.min.numerator;
-            }
-        }
-        else
-            ERR("Failed to get fps: %s.\n", strerror(errno));
-
-        new_caps = realloc(device->caps, (device->caps_count + 1) * sizeof(*device->caps));
-        if (!new_caps)
-            goto error;
-        device->caps = new_caps;
-        fill_caps(format.fmt.pix.pixelformat, frmsize.discrete.width, frmsize.discrete.height,
-                max_fps, min_fps, &device->caps[device->caps_count]);
-        device->caps_count++;
-
-        frmsize.index++;
-    }
 
     /* We reallocate the caps array, so we have to delay setting pbFormat. */
     for (i = 0; i < device->caps_count; ++i)
@@ -569,6 +653,27 @@ error:
     return E_FAIL;
 }
 
+static NTSTATUS v4l_device_get_frame_rates(void *args)
+{
+    struct get_frame_rate_params *params = args;
+    struct video_capture_device *device = get_device(params->device);
+    LONGLONG frame_rates[12];
+    LONG amount;
+    struct caps *cap;
+    if (params->index >= device->caps_count)
+        return E_INVALIDARG;
+    cap = &device->caps[params->index];
+    amount = cap->num_framerates;
+    *params->num_rates = amount;
+    if (params->rates)
+    {
+        for (int i = 0; i < amount; i++)
+            frame_rates[i] = 10000000/(cap->framerates[i].denominator / cap->framerates[i].numerator);
+        memcpy(params->rates, frame_rates, sizeof(LONGLONG)*amount);
+    }
+    return S_OK;
+}
+
 static NTSTATUS v4l_device_destroy( void *args )
 {
     const struct destroy_params *params = args;
@@ -591,6 +696,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     v4l_device_get_prop,
     v4l_device_set_prop,
     v4l_device_read_frame,
+    v4l_device_get_frame_rates
 };
 
 #ifdef _WIN64
@@ -841,6 +947,27 @@ static NTSTATUS wow64_v4l_device_read_frame( void *args )
     return v4l_device_read_frame( &params );
 }
 
+static NTSTATUS wow64_v4l_device_get_frame_rates( void *args )
+{
+    struct
+    {
+        video_capture_device_t   device;
+        LONG                     index;
+        PTR32                    num_rates;
+        PTR32                    rates;
+    } const *params32 = args;
+
+    struct get_frame_rate_params params =
+    {
+        params32->device,
+        params32->index,
+        ULongToPtr(params32->num_rates),
+        ULongToPtr(params32->rates)
+    };
+
+    return v4l_device_get_frame_rates(&params);
+}
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wow64_v4l_device_create,
@@ -855,6 +982,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_v4l_device_get_prop,
     v4l_device_set_prop,
     wow64_v4l_device_read_frame,
+    wow64_v4l_device_get_frame_rates
 };
 
 #endif /* _WIN64 */

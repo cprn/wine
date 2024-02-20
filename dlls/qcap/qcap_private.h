@@ -126,6 +126,14 @@ struct read_frame_params
     void                        *data;
 };
 
+struct get_frame_rate_params
+{
+    video_capture_device_t       device;
+    LONG                         index;
+    LONG                        *num_rates;
+    LONGLONG                    *rates;
+};
+
 enum unix_funcs
 {
     unix_create,
@@ -140,6 +148,7 @@ enum unix_funcs
     unix_get_prop,
     unix_set_prop,
     unix_read_frame,
+    unix_get_frame_rates
 };
 
 #endif
